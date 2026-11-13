@@ -1,0 +1,33 @@
+name: Waza v0.41.0 reusable consumers
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  skill-eval:
+    uses: microsoft/waza/.github/workflows/waza.yaml@v0.41.0
+    with:
+      eval-path: eval/eval.yaml
+
+  waza-evaluation:
+    uses: microsoft/waza/.github/workflows/waza-eval.yml@v0.41.0
+    with:
+      eval-yaml: eval/eval.yaml
+
+  report:
+    needs: [skill-eval]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Record reusable outputs
+        env:
+          PASS_RATE: ${{ needs.skill-eval.outputs.pass-rate }}
+          COMPOSITE: ${{ needs.skill-eval.outputs.composite-score }}
+          STATUS: ${{ needs.skill-eval.outputs.status }}
+        run: |
+          echo "pass-rate=$PASS_RATE composite-score=$COMPOSITE status=$STATUS"
+          test "$STATUS" = success

@@ -1,0 +1,208 @@
+name: Skills CI Example - Waza Evaluation
+
+# This is a template workflow for microsoft/skills repositories.
+# Copy this file to your skill repository's .github/workflows/ directory
+# and customize it for your skill.
+#
+# This example shows how to:
+# 1. Install the published Go waza binary
+# 2. Run evaluations with the mock executor (no API keys needed)
+# 3. Upload results as artifacts
+# 4. Use exit codes for CI pass/fail
+
+on:
+  # Trigger on pull requests
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'SKILL.md'
+      - 'eval/**'
+      - '.github/workflows/skills-ci-example.yml'
+  
+  # Trigger on pushes to main
+  push:
+    branches: [ main ]
+    paths:
+      - 'SKILL.md'
+      - 'eval/**'
+  
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      eval-yaml:
+        description: 'Path to evaluation YAML file'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate-skill:
+    name: Evaluate Skill with Waza
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      
+      - name: Install Waza
+        if: github.repository != 'microsoft/waza'
+        run: |
+          curl -fsSL \
+            https://raw.githubusercontent.com/microsoft/waza/v0.41.0/.github/scripts/install-waza-release.sh \
+            -o "$RUNNER_TEMP/install-waza-release.sh"
+          bash "$RUNNER_TEMP/install-waza-release.sh" 0.41.0
+
+      - name: Setup Go for repository source check
+        if: github.repository == 'microsoft/waza'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26'
+
+      - name: Setup Node for repository source check
+        if: github.repository == 'microsoft/waza'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
+      - name: Build exact repository source and install offline guard
+        if: github.repository == 'microsoft/waza'
+        run: |
+          make build VERSION=0.41.0
+          echo "$GITHUB_WORKSPACE" >> "$GITHUB_PATH"
+          bash .github/scripts/go_offline_env.sh >> "$GITHUB_ENV"
+
+      - name: Verify Waza binary
+        run: waza --version
+      
+      - name: Determine Eval File
+        id: eval-file
+        env:
+          EVAL_INPUT: ${{ inputs.eval-yaml }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          default_eval=eval/eval.yaml
+          if [ "$REPOSITORY" = microsoft/waza ]; then
+            default_eval=examples/code-explainer/eval.yaml
+          fi
+          EVAL_FILE="${EVAL_INPUT:-$default_eval}"
+          if [[ "$EVAL_FILE" == *$'\n'* || "$EVAL_FILE" == *$'\r'* ]]; then
+            echo "::error::Evaluation file must be a single-line path"
+            exit 1
+          fi
+          
+          # Verify file exists
+          if [ ! -f "$EVAL_FILE" ]; then
+            echo "::error::Evaluation file not found: $EVAL_FILE"
+            echo "Expected structure:"
+            echo "  your-skill/"
+            echo "  ├── SKILL.md"
+            echo "  └── eval/"
+            echo "      ├── eval.yaml"
+            echo "      ├── tasks/"
+            echo "      └── fixtures/"
+            exit 1
+          fi
+          
+          echo "eval-file=$EVAL_FILE" >> "$GITHUB_OUTPUT"
+          echo "Using eval file: $EVAL_FILE"
+      
+      - name: Run Waza Evaluation
+        id: run-eval
+        env:
+          EVAL_FILE: ${{ steps.eval-file.outputs.eval-file }}
+        run: |
+          rm -f -- results.json
+          set +e
+          waza run "$EVAL_FILE" \
+            --verbose \
+            --output results.json
+          exit_code=$?
+          set -e
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Results
+        id: validate
+        if: always()
+        env:
+          RUN_EXIT_CODE: ${{ steps.run-eval.outputs.exit_code }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          validator=.github/scripts/validate-waza-result.sh
+          if [ "$REPOSITORY" != microsoft/waza ]; then
+            validator="$RUNNER_TEMP/validate-waza-result.sh"
+            curl -fsSL \
+              https://raw.githubusercontent.com/microsoft/waza/v0.41.0/.github/scripts/validate-waza-result.sh \
+              -o "$validator"
+          fi
+          bash "$validator" results.json 0 "$RUN_EXIT_CODE"
+          if [ "$REPOSITORY" = microsoft/waza ]; then
+            test ! -e "$COPILOT_CLI_PATH.invoked"
+          fi
+      
+      - name: Upload Results Artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: waza-evaluation-results
+          path: |
+            results.json
+            transcripts/
+          retention-days: 30
+          if-no-files-found: error
+      
+      - name: Display Results Summary
+        if: always()
+        run: |
+          if [ -f results.json ]; then
+            echo "## Evaluation Results" >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            head -50 results.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      
+      - name: Check Evaluation Status
+        if: always()
+        env:
+          VALIDATION_OUTCOME: ${{ steps.validate.outcome }}
+          EVALUATION_STATUS: ${{ steps.validate.outputs.status }}
+        run: |
+          if [ "$VALIDATION_OUTCOME" != "success" ] || [ "$EVALUATION_STATUS" != "success" ]; then
+            exit 1
+          fi
+
+  # Optional: Test with Copilot SDK executor (requires GITHUB_TOKEN)
+  # Uncomment this job if you want to test with actual AI models
+  # evaluate-with-copilot:
+  #   name: Evaluate with Copilot SDK
+  #   runs-on: ubuntu-latest
+  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  #   
+  #   steps:
+  #     - name: Checkout Repository
+  #       uses: actions/checkout@v7
+  #     
+  #     - name: Install Waza
+  #       run: |
+  #         curl -fsSL https://raw.githubusercontent.com/microsoft/waza/main/install.sh | bash
+  #         echo "$HOME/bin" >> "$GITHUB_PATH"
+  #         waza --version
+  #     
+  #     - name: Run Evaluation with Copilot
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       run: |
+  #         # Update eval.yaml to use copilot-sdk executor
+  #         # Then run evaluation
+  #         waza run eval/eval.yaml --verbose --output results-copilot.json
+  #     
+  #     - name: Upload Copilot Results
+  #       if: always()
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         name: waza-copilot-results
+  #         path: results-copilot.json
+  #         if-no-files-found: error
